@@ -14,53 +14,25 @@ from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import SentenceTransformer, util
 from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
+import json
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-IMAGE_FOLDER = "static/images_db"
-UPLOAD_FOLDER = "uploads"
-os.makedirs(IMAGE_FOLDER, exist_ok=True)
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 text_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 
-class MatchType(str, Enum):
-    text = "text"
-    image = "image"
-    both = "both"
-
-
-class MatchTextData(BaseModel):
-    match_type: MatchType
-    lost_brand: str = ""
-    lost_color: str = ""
-    lost_government: str = ""
-    lost_center: str = ""
-    lost_street: str = ""
-    lost_contact: str = ""
-    found_brand: str = ""
-    found_color: str = ""
-    found_government: str = ""
-    found_center: str = ""
-    found_street: str = ""
-    found_contact: str = ""
-
-    @validator("*", pre=True)
-    def allow_numbers_in_fields(cls, v):
-        if isinstance(v, str) and len(v.strip()) == 0:
-            return ""
-        return v
-
-    @validator("lost_street", "found_street")
-    def validate_street(cls, v):
-        if not isinstance(v, str):
-            raise ValueError("Street must be a string.")
-        return v.strip()
 
 
 attributes = {
@@ -136,87 +108,144 @@ def find_most_similar_images_faiss(input_image_path, image_folder, top_k=3):
         results.append(result)
     return results
 
+async def save_to_file_system(prefix, image_dir, json_path, json_key,
+                                governorate, city, street, contact,
+                            brand, color, image, image_name):
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+
+    image_filename = image_name
+    image_path = os.path.join(image_dir, image_filename)
+
+    image.file.seek(0)
+    with open(image_path, "wb") as buffer:
+        shutil.copyfileobj(image.file, buffer)
+
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {json_key: []}
+
+    data[json_key].append({
+        "governorate": governorate,
+        "city": city,
+        "street": street,
+        "contact": contact,
+        "brand": brand,
+        "color": color,
+        "image_url": f"http://localhost:8004/{image_path.replace(os.sep, '/')}"
+    })
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return {"status": "added", "image": f"http://localhost:8004/{image_path.replace(os.sep, '/')}"}
+
+@app.post("/add_found")
+async def add_found(
+    governorate: str = Form(...),
+    city: str = Form(...),
+    street: str = Form(...),
+    contact: str = Form(...),
+    image_name: str = Form(...),
+    brand: str = Form(...),
+    color: str = Form(...),
+    image: UploadFile = File(None)
+):
+    return await save_to_file_system(
+        prefix="founded",
+        image_dir="static/foundedphone",
+        json_path="metadata/foundedphone/foundedphone.json",
+        json_key="founded",
+        governorate=governorate,
+        city=city,
+        street=street,
+        contact=contact,
+        brand=brand,
+        color=color,
+        image=image,
+        image_name=image_name
+    )
+
+class MatchType(str, Enum):
+    text = "text"
+    image = "image"
+    both = "both"
+class Lost(BaseModel):
+    governorate: str = Form(...)
+    city: str = Form(...)
+    street: str = Form(...)
+    contact: str = Form(...)
+    brand: str = Form(...)
+    color: str = Form(...)
+    image: UploadFile = File(...)
+
+class MatchRequest(BaseModel):
+    match_type: MatchType
+    lost: Lost
+
+
+
 
 @app.post("/match/")
-async def match_items(
-    match_type: MatchType = Form(...),
-    lost_brand: str = Form(""),
-    lost_color: str = Form(""),
-    lost_government: str = Form(""),
-    lost_center: str = Form(""),
-    lost_street: str = Form(""),
-    lost_contact: str = Form(""),
-    found_brand: str = Form(""),
-    found_color: str = Form(""),
-    found_government: str = Form(""),
-    found_center: str = Form(""),
-    found_street: str = Form(""),
-    found_contact: str = Form(""),
-    image: UploadFile = File(None),
-):
-    # تحقق من الحقول بناءً على نوع المطابقة
-    if match_type in ["text", "both"]:
-        text_data = MatchTextData(
-            match_type=match_type,
-            lost_brand=lost_brand,
-            lost_color=lost_color,
-            lost_government=lost_government,
-            lost_center=lost_center,
-            lost_street=lost_street,
-            lost_contact=lost_contact,
-            found_brand=found_brand,
-            found_color=found_color,
-            found_government=found_government,
-            found_center=found_center,
-            found_street=found_street,
-            found_contact=found_contact,
-        )
-    if match_type in ["image", "both"] and not image:
-        raise HTTPException(status_code=400, detail="Image is required for image or both match types.")
+async def match(request: MatchRequest):
+    match_type = request.match_type
+    lost = request.lost
+    lost_dict = lost.dict()
+    image = lost.image
 
-    lost_item = {
-        "brand": lost_brand,
-        "color": lost_color,
-        "government": lost_government,
-        "center": lost_center,
-        "street": lost_street,
-        "contact": lost_contact,
-    }
+    metadata_path = "metadata/foundedphone/foundedphone.json"
+    if not os.path.exists(metadata_path):
+        return JSONResponse(status_code=404, content={"error": "foundedphone.json not found"})
 
-    found_item = {
-        "brand": found_brand,
-        "color": found_color,
-        "government": found_government,
-        "center": found_center,
-        "street": found_street,
-        "contact": found_contact,
-    }
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    image_score = 0
+    found_list = data.get("founded", [])
+    if not found_list:
+        return JSONResponse(status_code=404, content={"error": "No found items available"})
+
     text_score = 0
+    image_score = 0
     final_score = 0
+    text_best_match = None
     matched_images = []
 
+    temp_path = None  
     try:
         if match_type in ["image", "both"] and image:
             temp_filename = f"{uuid.uuid4().hex}_{image.filename}"
+            UPLOAD_FOLDER = "static/uploads"
+            os.makedirs(UPLOAD_FOLDER, exist_ok=True)
             temp_path = os.path.join(UPLOAD_FOLDER, temp_filename)
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(image.file, buffer)
-
+                
+            IMAGE_FOLDER = "static/foundedphone"
             image_results = find_most_similar_images_faiss(temp_path, IMAGE_FOLDER, top_k=3)
+            image_score = image_results[0]["similarity"] if image_results else 0
 
-            matched_images = [
-                {
-                    "image_url": f"/static/images_db/{os.path.basename(res['image_path'])}",
-                    "image_similarity": round(res["similarity"], 4)
-                }
-                for res in image_results
-            ]
-            image_score = image_results[0]["similarity"]
+            for res in image_results:
+                image_name = os.path.basename(res["image_path"])
+                associated_data = next(
+                    (item for item in found_list if item.get("image_name") == image_name),
+                    None
+                )
+                matched_images.append({
+                    "image_url": f"/static/foundedcard/{image_name}",
+                    "image_similarity": round(res["similarity"], 4),
+                    "associated_data": associated_data
+                })
 
         if match_type in ["text", "both"]:
-            text_score = calculate_similarity(lost_item, found_item)
+            best_score = -1
+            for found_data in found_list:
+                score = calculate_similarity(found_data, lost_dict)
+                if score > best_score:
+                    best_score = score
+                    text_best_match = found_data
+            text_score = best_score
 
         if match_type == "text":
             final_score = text_score
@@ -225,18 +254,20 @@ async def match_items(
         elif match_type == "both":
             final_score = (text_score * 0.5) + (image_score * 0.5)
 
-        matched = 1 if final_score > 0.7 else 0
+        matched = 1 if final_score >= 0.7 else 0
 
         return JSONResponse({
             "match_type": match_type,
-            "matched_images": matched_images,
-            "image_similarity": round(image_score, 4),
-            "text_similarity": round(text_score, 4),
+            "matched": matched,
             "final_score": round(final_score, 4),
-            "matched": matched
+
+            "text_similarity": round(text_score, 4),
+            "text_best_match": text_best_match,
+
+            "image_similarity": round(image_score, 4),
+            "matched_images": matched_images
         })
 
     finally:
-        if match_type in ["image", "both"] and image:
+        if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
-
